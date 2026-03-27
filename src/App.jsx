@@ -6,6 +6,8 @@ import { getWeather, getArea } from './lib/api';
 
 const MAPBOX_TOKEN = import.meta.env.VITE_MAPBOX_TOKEN;
 
+const FRIEND_RING_COLORS = ['#FF8C42', '#4ECDC4', '#A78BFA', '#38BDF8'];
+
 const COLORS = [
   { color:"#F9A8B8", grad:"linear-gradient(135deg,#F9A8B8,#F48CA0)" },
   { color:"#FFC078", grad:"linear-gradient(135deg,#FFC078,#F0A858)" },
@@ -58,6 +60,7 @@ function dbToPin(m) {
   const dt = new Date(m.created_at);
   return {
     id: m.id,
+    userId: m.user_id,
     color: m.color || COLORS[0].color,
     grad: m.grad || COLORS[0].grad,
     photo: null,
@@ -74,14 +77,14 @@ function dbToPin(m) {
 }
 
 // Pin marker shape (reusable for map and list)
-function PinShape({ pin, size=40 }) {
+function PinShape({ pin, size=40, ringColor=null }) {
   return (
     <div style={{
       width: size, height: size,
       borderRadius: '50% 50% 50% 4px',
       transform: 'rotate(-45deg)',
       overflow: 'hidden',
-      border: `${size/14}px solid white`,
+      border: `${size/14}px solid ${ringColor || 'white'}`,
       background: pin.grad,
       flexShrink: 0,
     }}>
@@ -115,6 +118,9 @@ export default function Weav() {
   const [locDenied, setLocDenied]         = useState(false);
   const [viewState, setViewState]         = useState({ longitude: 139.6917, latitude: 35.6895, zoom: 12 });
   const [userId, setUserId]               = useState(null);
+  const [friends, setFriends]             = useState([]);
+  const [friendsOpen, setFriendsOpen]     = useState(false);
+  const [inviteCopied, setInviteCopied]   = useState(false);
 
   const videoRef   = useRef(null);
   const streamRef  = useRef(null);
@@ -123,16 +129,25 @@ export default function Weav() {
   // Initial setup
   useEffect(() => {
     setTimeout(() => setReady(true), 250);
+    const joinCode = new URLSearchParams(window.location.search).get('join');
     if (supabase) {
-      // 匿名ログイン → 自分の投稿だけ表示
+      const setup = async (uid) => {
+        setUserId(uid);
+        await loadMemories();
+        await loadFriends(uid);
+        if (joinCode) {
+          await joinMap(joinCode, uid);
+          window.history.replaceState({}, '', window.location.pathname);
+          await loadMemories();
+          await loadFriends(uid);
+        }
+      };
       supabase.auth.getSession().then(({ data: { session } }) => {
         if (session) {
-          setUserId(session.user.id);
-          loadMemories();
+          setup(session.user.id);
         } else {
           supabase.auth.signInAnonymously().then(({ data }) => {
-            setUserId(data.user?.id);
-            loadMemories();
+            if (data.user) setup(data.user.id);
           });
         }
       });
@@ -140,20 +155,63 @@ export default function Weav() {
     getUserLocation();
   }, []);
 
-  // Camera lifecycle
+  // Camera lifecycle — keep stream alive within record screen to avoid re-prompting
   useEffect(() => {
     if (screen === "record" && step === "camera") {
-      startCamera();
-    } else {
+      if (!streamRef.current) startCamera();
+    } else if (screen !== "record") {
       stopCamera();
     }
-    return () => stopCamera();
+    return () => { if (screen !== "record") stopCamera(); };
   }, [screen, step]);
 
   // ── Data ──────────────────────────────────────────────
   async function loadMemories() {
     const { data } = await supabase.from('memories').select('*').order('created_at', { ascending: false });
     if (data?.length > 0) setMemories(data.map(dbToPin));
+  }
+
+  async function loadFriends(uid) {
+    const myId = uid ?? userId;
+    if (!myId) return;
+    const { data } = await supabase.from('friendships').select('*');
+    if (!data) return;
+    const list = data.map((f, i) => ({
+      id: f.user_a === myId ? f.user_b : f.user_a,
+      friendshipId: f.id,
+      color: FRIEND_RING_COLORS[i % FRIEND_RING_COLORS.length],
+      label: `友達 ${i + 1}`,
+    }));
+    setFriends(list);
+  }
+
+  async function generateInviteCode() {
+    const myId = userId ?? (await supabase.auth.getUser()).data.user?.id;
+    const code = Math.random().toString(36).slice(2, 10);
+    await supabase.from('invites').insert({ code, owner_id: myId });
+    const url = `${window.location.origin}${window.location.pathname}?join=${code}`;
+    try {
+      await navigator.clipboard.writeText(url);
+    } catch {
+      prompt('招待リンクをコピーしてください:', url);
+    }
+    setInviteCopied(true);
+    setTimeout(() => setInviteCopied(false), 2500);
+  }
+
+  async function joinMap(code, uid) {
+    const myId = uid ?? userId;
+    const { data: invite } = await supabase.from('invites').select('owner_id').eq('code', code).single();
+    if (!invite || invite.owner_id === myId) return;
+    await supabase.from('friendships').insert({ user_a: invite.owner_id, user_b: myId });
+    setFriendsOpen(true);
+  }
+
+  async function disconnectFriend(friendshipId) {
+    if (!confirm('連携を解除しますか？この友達のピンは非表示になります。')) return;
+    await supabase.from('friendships').delete().eq('id', friendshipId);
+    setFriends(prev => prev.filter(f => f.friendshipId !== friendshipId));
+    loadMemories();
   }
 
   // ── Location ──────────────────────────────────────────
@@ -182,9 +240,26 @@ export default function Weav() {
   async function fetchLocationAndWeather() {
     setLocating(true);
     try {
-      const pos = await new Promise((res, rej) =>
-        navigator.geolocation.getCurrentPosition(res, rej, { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 })
-      );
+      const pos = await new Promise((res, rej) => {
+        let best = null;
+        let watchId;
+        const timer = setTimeout(() => {
+          navigator.geolocation.clearWatch(watchId);
+          if (best) res(best); else rej(new Error('timeout'));
+        }, 15000);
+        watchId = navigator.geolocation.watchPosition(
+          (p) => {
+            if (!best || p.coords.accuracy < best.coords.accuracy) best = p;
+            if (p.coords.accuracy <= 20) {
+              clearTimeout(timer);
+              navigator.geolocation.clearWatch(watchId);
+              res(p);
+            }
+          },
+          (e) => { clearTimeout(timer); navigator.geolocation.clearWatch(watchId); rej(e); },
+          { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+        );
+      });
       const { latitude: lat, longitude: lng } = pos.coords;
       setCurrentLoc({ lat, lng });
       const [wx, area] = await Promise.all([
@@ -231,7 +306,6 @@ export default function Weav() {
     canvas.height = video.videoHeight || 720;
     canvas.getContext('2d').drawImage(video, 0, 0);
     setCapturedPhoto(canvas.toDataURL('image/jpeg', 0.85));
-    stopCamera();
     setStep("confirm");
     fetchLocationAndWeather();
   }
@@ -269,7 +343,8 @@ export default function Weav() {
     };
 
     if (supabase) {
-      const { data } = await supabase.from('memories').insert(record).select().single();
+      const { data, error } = await supabase.from('memories').insert(record).select().single();
+      if (error) console.error('Insert failed:', error);
       if (data) setMemories(prev => [dbToPin(data), ...prev]);
     } else {
       setMemories(prev => [{
@@ -456,6 +531,21 @@ export default function Weav() {
         /* mapbox attribution small */
         .mapboxgl-ctrl-attrib{font-size:9px!important;opacity:.5}
         .mapboxgl-ctrl-logo{opacity:.4;transform:scale(.7);transform-origin:bottom left}
+        /* friends */
+        .fr-btn{width:34px;height:34px;border-radius:50%;background:rgba(255,255,255,.92);backdrop-filter:blur(16px);border:1.5px solid rgba(0,0,0,.1);cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;box-shadow:0 2px 8px rgba(0,0,0,.08)}
+        .fr-btn svg{width:16px;height:16px;stroke:#FF6B8A;stroke-width:1.7;fill:none;stroke-linecap:round;stroke-linejoin:round}
+        .fr-overlay{position:absolute;inset:0;background:rgba(0,0,0,.4);z-index:100;display:flex;flex-direction:column;justify-content:flex-end}
+        .fr-sheet{background:#fff;border-radius:26px 26px 0 0;padding:20px 24px 48px;display:flex;flex-direction:column;gap:14px}
+        .fr-hdl{width:34px;height:3.5px;background:rgba(0,0,0,.08);border-radius:2px;margin:0 auto}
+        .fr-title{font:700 18px/1 'DM Sans',sans-serif;color:#1A1A1A;letter-spacing:-.3px}
+        .fr-invite{width:100%;padding:14px;border-radius:14px;background:linear-gradient(135deg,#FF9A7B,#FF6B8A);color:#fff;border:none;font:500 14px/1 'Noto Sans JP',sans-serif;cursor:pointer;transition:all .2s}
+        .fr-invite:active{transform:scale(.97)}.fr-invite.copied{background:linear-gradient(135deg,#8DD9A8,#66C88A)}
+        .fr-empty{font:400 13px/1.6 'Noto Sans JP',sans-serif;color:#AAA;text-align:center;padding:12px 0}
+        .fr-item{display:flex;align-items:center;gap:10px;padding:12px 14px;background:#F8F8F8;border-radius:14px}
+        .fr-dot{width:12px;height:12px;border-radius:50%;flex-shrink:0}
+        .fr-lbl{font:400 13px/1 'Noto Sans JP',sans-serif;color:#555;flex:1}
+        .fr-disc{padding:6px 12px;border-radius:8px;background:none;border:1.5px solid rgba(0,0,0,.1);font:400 11px/1 'Noto Sans JP',sans-serif;color:#AAA;cursor:pointer;white-space:nowrap}
+        .fr-disc:active{background:#F0F0F0}
         /* mobile fullscreen */
         @media(max-width:430px){
           .outer{padding:0!important;background:white!important;min-height:100dvh!important;align-items:flex-start!important}
@@ -494,7 +584,7 @@ export default function Weav() {
                       style={{ animationDelay: `${i * .06}s` }}
                       onClick={e => { e.stopPropagation(); setPin(p); go("detail"); }}
                     >
-                      <PinShape pin={p} size={40} />
+                      <PinShape pin={p} size={40} ringColor={p.userId && p.userId !== userId ? (friends.find(f => f.id === p.userId)?.color ?? null) : null} />
                     </div>
                   </Marker>
                 ))}
@@ -519,7 +609,7 @@ export default function Weav() {
                   const pp  = pos[i % pos.length];
                   return (
                     <div key={p.id} className="pn pa" style={{position:"absolute",top:`${pp.top}%`,left:`${pp.left}%`,transform:'translate(-50%,-100%)',animationDelay:`${i*.06}s`}} onClick={()=>{setPin(p);go("detail")}}>
-                      <PinShape pin={p} size={40} />
+                      <PinShape pin={p} size={40} ringColor={p.userId && p.userId !== userId ? (friends.find(f => f.id === p.userId)?.color ?? null) : null} />
                     </div>
                   );
                 })}
@@ -530,7 +620,12 @@ export default function Weav() {
 
           <div className="hd">
             <div className="lg">weav</div>
-            <div className="bd">this month<b>{thisMonth}</b></div>
+            <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+              <button className="fr-btn" onClick={() => setFriendsOpen(true)}>
+                <svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+              </button>
+              <div className="bd">this month<b>{thisMonth}</b></div>
+            </div>
           </div>
           {/* 現在地ボタン */}
           <button
@@ -653,6 +748,31 @@ export default function Weav() {
             </button>
           </div>
         </div>
+
+        {/* ── FRIENDS PANEL ── */}
+        {friendsOpen && (
+          <div className="fr-overlay" onClick={() => setFriendsOpen(false)}>
+            <div className="fr-sheet" onClick={e => e.stopPropagation()}>
+              <div className="fr-hdl"/>
+              <div className="fr-title">友達</div>
+              {supabase && (
+                <button className={`fr-invite ${inviteCopied ? 'copied' : ''}`} onClick={generateInviteCode}>
+                  {inviteCopied ? 'リンクをコピーしました！' : '招待リンクを作成'}
+                </button>
+              )}
+              {friends.length === 0
+                ? <div className="fr-empty">まだ友達がいません<br/>招待リンクを送って繋がろう</div>
+                : friends.map(f => (
+                  <div key={f.id} className="fr-item">
+                    <div className="fr-dot" style={{ background: f.color }}/>
+                    <div className="fr-lbl">{f.label}</div>
+                    <button className="fr-disc" onClick={() => disconnectFriend(f.friendshipId)}>連携解除</button>
+                  </div>
+                ))
+              }
+            </div>
+          </div>
+        )}
 
         {/* ── TOAST ── */}
         <div className={`to ${toast ? "show" : ""}`}>
