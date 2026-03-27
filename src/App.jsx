@@ -265,7 +265,7 @@ export default function Weav() {
       temp:       currentWeather.temp,
       color, grad, photo_url,
       created_at: now.toISOString(),
-      user_id:    userId,
+      user_id:    userId ?? (await supabase.auth.getUser()).data.user?.id,
     };
 
     if (supabase) {
