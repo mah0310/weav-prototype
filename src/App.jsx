@@ -303,7 +303,7 @@ export default function Weav() {
   const todayStr = `${now.getMonth()+1}.${now.getDate()}`;
 
   return (
-    <div style={{ display:"flex", alignItems:"center", justifyContent:"center", minHeight:"100vh", background:"linear-gradient(135deg,#FFF0E8 0%,#F0E8FF 50%,#E8F4FF 100%)", padding:20 }}>
+    <div className="outer" style={{ display:"flex", alignItems:"center", justifyContent:"center", minHeight:"100vh", background:"linear-gradient(135deg,#FFF0E8 0%,#F0E8FF 50%,#E8F4FF 100%)", padding:20 }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Noto+Sans+JP:wght@300;400;500;600;700&display=swap');
         *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
@@ -425,6 +425,13 @@ export default function Weav() {
         /* mapbox attribution small */
         .mapboxgl-ctrl-attrib{font-size:9px!important;opacity:.5}
         .mapboxgl-ctrl-logo{opacity:.4;transform:scale(.7);transform-origin:bottom left}
+        /* mobile fullscreen */
+        @media(max-width:430px){
+          .outer{padding:0!important;background:white!important;min-height:100dvh!important;align-items:flex-start!important}
+          .ph{width:100vw!important;height:100dvh!important;border-radius:0!important;box-shadow:none!important}
+          .notch{display:none!important}
+          .stbar{display:none!important}
+        }
       `}</style>
 
       <div className="ph">
