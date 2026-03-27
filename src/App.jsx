@@ -114,6 +114,7 @@ export default function Weav() {
   const [cameraError, setCameraError]     = useState(null);
   const [locDenied, setLocDenied]         = useState(false);
   const [viewState, setViewState]         = useState({ longitude: 139.6917, latitude: 35.6895, zoom: 12 });
+  const [userId, setUserId]               = useState(null);
 
   const videoRef   = useRef(null);
   const streamRef  = useRef(null);
@@ -122,7 +123,20 @@ export default function Weav() {
   // Initial setup
   useEffect(() => {
     setTimeout(() => setReady(true), 250);
-    if (supabase) loadMemories();
+    if (supabase) {
+      // 匿名ログイン → 自分の投稿だけ表示
+      supabase.auth.getSession().then(({ data: { session } }) => {
+        if (session) {
+          setUserId(session.user.id);
+          loadMemories();
+        } else {
+          supabase.auth.signInAnonymously().then(({ data }) => {
+            setUserId(data.user?.id);
+            loadMemories();
+          });
+        }
+      });
+    }
     getUserLocation();
   }, []);
 
@@ -152,7 +166,8 @@ export default function Weav() {
         setLocDenied(false);
         setViewState(v => ({ ...v, latitude: loc.lat, longitude: loc.lng, zoom: 14 }));
       },
-      () => { setLocDenied(true); }
+      () => { setLocDenied(true); },
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
     );
   }
 
@@ -168,7 +183,7 @@ export default function Weav() {
     setLocating(true);
     try {
       const pos = await new Promise((res, rej) =>
-        navigator.geolocation.getCurrentPosition(res, rej, { timeout: 10000 })
+        navigator.geolocation.getCurrentPosition(res, rej, { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 })
       );
       const { latitude: lat, longitude: lng } = pos.coords;
       setCurrentLoc({ lat, lng });
@@ -250,6 +265,7 @@ export default function Weav() {
       temp:       currentWeather.temp,
       color, grad, photo_url,
       created_at: now.toISOString(),
+      user_id:    userId,
     };
 
     if (supabase) {
@@ -283,6 +299,21 @@ export default function Weav() {
         setViewState(v => ({ ...v, latitude: currentLocation.lat, longitude: currentLocation.lng, zoom: 14 }));
       }
     }, 1800);
+  }
+
+  // ── Delete ────────────────────────────────────────────
+  async function deleteMemory(p) {
+    if (!confirm('この記録を削除しますか？')) return;
+    if (supabase) {
+      if (p.photoUrl) {
+        const filename = p.photoUrl.split('/').pop();
+        await supabase.storage.from('photos').remove([filename]);
+      }
+      await supabase.from('memories').delete().eq('id', p.id);
+    }
+    setMemories(prev => prev.filter(m => m.id !== p.id));
+    setPin(null);
+    go('map', 'map');
   }
 
   // ── Navigation ────────────────────────────────────────
@@ -637,6 +668,9 @@ export default function Weav() {
           {pin && <>
             <button className="cx" onClick={() => go("map","map")}>
               <svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+            </button>
+            <button className="cx" onClick={() => deleteMemory(pin)} style={{ left:'auto', right:20, background:'rgba(0,0,0,.18)' }}>
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="white" strokeWidth="2.2" strokeLinecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6m4-6v6"/><path d="M9 6V4h6v2"/></svg>
             </button>
             <div className="dp" style={{ background: pin.grad }}>
               {pin.photoUrl
